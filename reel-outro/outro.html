@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reel Outro</title>
+<style>
+  :root { --bg: #111116; --fg: #f2f2f5; --muted: #8a8a96; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 Inter, system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 16px;
+  }
+  canvas { height: min(82vh, 160vw); aspect-ratio: 9 / 16; border-radius: 14px; background: #000; cursor: pointer; }
+  .bar { display: flex; align-items: center; gap: 12px; width: min(100%, calc(min(82vh, 160vw) * 9 / 16)); }
+  .bar input { flex: 1; accent-color: #ff4d8d; }
+  .bar button { background: #26262e; color: var(--fg); border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  .bar span { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 4ch; text-align: right; }
+  body.render .bar { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<div class="bar">
+  <button id="play" type="button">Pause</button>
+  <input id="scrub" type="range" min="0" max="3" step="0.001" value="0">
+  <span id="time">0.00</span>
+</div>
+<script>
+'use strict';
+const W = 1080, H = 1920, DURATION = 3, FPS = 30, TAU = Math.PI * 2;
+
+// Everything you'd want to change is a URL parameter, e.g. outro.html?handle=@myshop&headline=See%20you%20soon
+const q = new URLSearchParams(location.search);
+const opt = (k, d) => (q.has(k) ? q.get(k) : d);
+const CFG = {
+  headline: opt('headline', 'Thanks for watching'),
+  handle: opt('handle', '@yourhandle'),
+  follow: opt('follow', 'Follow'),
+  following: opt('following', 'Following'),
+  initials: opt('initials', ''),
+  transparent: q.get('transparent') === '1',
+};
+const C = { bg: '#09090F', violet: '#7C5CFF', pink: '#FF4D8D', amber: '#FFB547' };
+const DISPLAY = '"Inter Display", Inter, system-ui, -apple-system, "Segoe UI", sans-serif';
+const TEXT = 'Inter, system-ui, -apple-system, "Segoe UI", sans-serif';
+
+// ---------- easing ----------
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, k) => a + (b - a) * k;
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const outCubic = k => 1 - (1 - k) ** 3;
+const inCubic = k => k ** 3;
+const inOutCubic = k => (k < 0.5 ? 4 * k ** 3 : 1 - (-2 * k + 2) ** 3 / 2);
+const outExpo = k => (k >= 1 ? 1 : 1 - 2 ** (-10 * k));
+const outBack = (k, s = 1.70158) => 1 + (s + 1) * (k - 1) ** 3 + s * (k - 1) ** 2;
+
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+function rng(seed) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- particles (seeded so every render is identical) ----------
+const rand = rng(7);
+const SPARKS = Array.from({ length: 34 }, () => ({
+  x: 40 + rand() * (W - 80), y: rand() * H, v: 30 + rand() * 70,
+  r: 1.4 + rand() * 2.4, f: 3 + rand() * 5, ph: rand() * TAU, a: 0.35 + rand() * 0.55,
+  c: rand() < 0.6 ? '#FFFFFF' : rand() < 0.5 ? '#C9BDFF' : '#FFC2D6',
+}));
+const CONFETTI = Array.from({ length: 40 }, () => ({
+  ang: -Math.PI / 2 + (rand() - 0.5) * Math.PI * 1.7, v: 900 + rand() * 1100,
+  size: 14 + rand() * 14, rot: rand() * TAU, vr: (rand() - 0.5) * 18,
+  c: [C.violet, C.pink, C.amber, '#FFFFFF'][Math.floor(rand() * 4)], bar: rand() < 0.55,
+}));
+const HEARTS = Array.from({ length: 5 }, (_, i) => ({
+  delay: i * 0.09, dx: (rand() - 0.5) * 30, drift: 150 + rand() * 80,
+  size: 40 + rand() * 24, ph: rand() * TAU, c: i % 2 ? C.pink : '#FF3B5C',
+}));
+const HEART = new Path2D('M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z');
+
+// ---------- layout ----------
+let L;
+let logo = null;
+
+function buildLayout(ctx) {
+  const words = CFG.headline.trim().split(/\s+/).filter(Boolean);
+  const maxW = 900;
+  let fs = 132, lines, space, widthOf;
+  for (;;) {
+    ctx.font = `900 ${fs}px ${DISPLAY}`;
+    ctx.letterSpacing = `${-fs * 0.025}px`;
+    space = ctx.measureText(' ').width;
+    widthOf = ws => ws.reduce((s, w) => s + ctx.measureText(w).width, 0) + space * (ws.length - 1);
+    lines = [];
+    let cur = [];
+    for (const w of words) {
+      if (cur.length && widthOf([...cur, w]) > maxW) { lines.push(cur); cur = [w]; } else cur.push(w);
+    }
+    if (cur.length) lines.push(cur);
+    if ((Math.max(0, ...lines.map(widthOf)) <= maxW && lines.length <= 3) || fs <= 60) break;
+    fs -= 6;
+  }
+  const lineH = fs * 1.02;
+  const R = 128, ringR = R + 22;
+
+  ctx.font = `800 50px ${DISPLAY}`;
+  ctx.letterSpacing = '0px';
+  const bCap = ctx.measureText('F').actualBoundingBoxAscent;
+  const gA = 26 + 18 + ctx.measureText(CFG.follow).width;
+  const gB = 32 + 18 + ctx.measureText(CFG.following).width;
+  const bh = 128;
+
+  // stack top-down, then centre the whole block slightly below the middle of the frame
+  let y = 0;
+  const avatarY = y + ringR; y += ringR * 2 + 66;
+  const firstBase = y + fs * 0.74;
+  const lastBase = firstBase + (lines.length - 1) * lineH;
+  y = lastBase + fs * 0.22;
+  let handleY = null;
+  if (CFG.handle) { handleY = y + 44 + 32; y = handleY + 10; }
+  const btnY = y + 74 + bh / 2;
+  const total = btnY + bh / 2;
+  const off = 975 - total / 2;
+
+  L = {
+    fs, lineH, R, ls: `${-fs * 0.025}px`, bCap, bh, bfs: 50, gA, gB,
+    bw0: Math.max(400, gA + 144), bw1: Math.max(400, gB + 144),
+    avatarY: avatarY + off, handleY: handleY == null ? null : handleY + off, btnY: btnY + off, cy: off + total / 2,
+    lines: lines.map((ws, i) => {
+      ctx.font = `900 ${fs}px ${DISPLAY}`;
+      ctx.letterSpacing = `${-fs * 0.025}px`;
+      const w = widthOf(ws);
+      let x = 0;
+      const items = ws.map(text => { const it = { text, x }; x += ctx.measureText(text).width + space; return it; });
+      return { words: items, w, x: (W - w) / 2, y: firstBase + i * lineH + off };
+    }),
+    initials: (CFG.initials || (CFG.handle || CFG.headline).replace(/^@/, '').trim().charAt(0)).toUpperCase(),
+  };
+}
+
+// ---------- drawing ----------
+let MASTER = 1;
+let ctx;
+const alpha = a => { ctx.globalAlpha = MASTER * clamp(a); };
+
+function blob(x, y, r, color, a) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, rgba(color, a));
+  g.addColorStop(0.55, rgba(color, a * 0.35));
+  g.addColorStop(1, rgba(color, 0));
+  ctx.fillStyle = g;
+  ctx.fillRect(x - r, y - r, r * 2, r * 2);
+}
+
+const revealR = t => outCubic(prog(t, 0, 0.55)) * 1500;
+
+function drawBackground(t) {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  const r = revealR(t);
+  if (r <= 0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(W / 2, L.avatarY, r, 0, TAU);
+  ctx.clip();
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+  blob(W / 2 + 220 * Math.sin(t * 0.9), L.avatarY + 60 * Math.cos(t * 0.8), 820, C.violet, 0.5);
+  blob(170 + 70 * Math.sin(t * 1.1 + 1), H * 0.7, 640, C.pink, 0.3);
+  blob(930, H * 0.8 + 70 * Math.sin(t * 0.9 + 2), 560, C.amber, 0.18);
+  const v = ctx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.75);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.6)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function cyclicGradient(rot, x, y) {
+  const g = ctx.createConicGradient(rot, x, y);
+  g.addColorStop(0, C.violet);
+  g.addColorStop(0.33, C.pink);
+  g.addColorStop(0.66, C.amber);
+  g.addColorStop(1, C.violet);
+  return g;
+}
+
+function drawRings(t) {
+  // the first ring rides the edge of the background reveal
+  for (const [a, d, maxR, w] of [[0, 0.55, 1500, 18], [0.12, 0.7, 1100, 7]]) {
+    const p = prog(t, a, a + d);
+    if (p <= 0 || p >= 1) continue;
+    ctx.strokeStyle = cyclicGradient(t * 2, W / 2, L.avatarY);
+    ctx.lineWidth = w * (1 - 0.6 * p);
+    alpha((1 - p) ** 1.4);
+    ctx.beginPath();
+    ctx.arc(W / 2, L.avatarY, outCubic(p) * maxR, 0, TAU);
+    ctx.stroke();
+  }
+}
+
+function drawSparks(t) {
+  const ap = prog(t, 0.25, 0.8) * (CFG.transparent ? 0.6 : 1);
+  if (ap <= 0) return;
+  for (const s of SPARKS) {
+    const y = (((s.y - s.v * t) % H) + H) % H;
+    const tw = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * s.f + s.ph));
+    ctx.fillStyle = s.c;
+    alpha(ap * tw * s.a);
+    ctx.beginPath(); ctx.arc(s.x, y, s.r, 0, TAU); ctx.fill();
+  }
+}
+
+function drawAvatar(t) {
+  const p = prog(t, 0.14, 0.62);
+  if (p <= 0) return;
+  const cx = W / 2, cy = L.avatarY, R = L.R;
+  const s = Math.max(0, outBack(p, 2.2));
+
+  const gp = outCubic(p) * (1 + 0.05 * Math.sin(t * 5));
+  const g = ctx.createRadialGradient(cx, cy, R * 0.4, cx, cy, R * 2.6 * gp + 1);
+  g.addColorStop(0, rgba(C.violet, 0.7));
+  g.addColorStop(0.45, rgba(C.pink, 0.22));
+  g.addColorStop(1, rgba(C.pink, 0));
+  alpha(0.7 * outCubic(p));
+  ctx.fillStyle = g;
+  ctx.fillRect(cx - R * 3, cy - R * 3, R * 6, R * 6);
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(s, s);
+  alpha(1);
+  const d = ctx.createLinearGradient(0, -R, 0, R);
+  d.addColorStop(0, '#2B2550');
+  d.addColorStop(1, '#13121F');
+  ctx.beginPath();
+  ctx.arc(0, 0, R, 0, TAU);
+  ctx.fillStyle = d;
+  ctx.fill();
+  if (logo) {
+    ctx.save();
+    ctx.clip();
+    const k = Math.max((R * 2) / logo.width, (R * 2) / logo.height);
+    ctx.drawImage(logo, (-logo.width * k) / 2, (-logo.height * k) / 2, logo.width * k, logo.height * k);
+    ctx.restore();
+  } else if (L.initials) {
+    ctx.font = `900 124px ${DISPLAY}`;
+    ctx.letterSpacing = '0px';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    const m = ctx.measureText(L.initials);
+    const ig = ctx.createLinearGradient(0, -60, 0, 60);
+    ig.addColorStop(0, '#FFFFFF');
+    ig.addColorStop(1, '#D4C9FF');
+    ctx.fillStyle = ig;
+    ctx.fillText(L.initials, 0, (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2);
+  }
+  ctx.beginPath();
+  ctx.arc(0, 0, R, 0, TAU);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.stroke();
+
+  const k = inOutCubic(prog(t, 0.26, 0.95));
+  if (k > 0) {
+    const rr = R + 22, a0 = -Math.PI / 2 + t * 0.9, a1 = a0 + k * TAU;
+    ctx.strokeStyle = cyclicGradient(a0, 0, 0);
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(0, 0, rr, a0, a1);
+    ctx.stroke();
+    if (k < 1) {
+      const hx = Math.cos(a1) * rr, hy = Math.sin(a1) * rr;
+      const hg = ctx.createRadialGradient(hx, hy, 0, hx, hy, 34);
+      hg.addColorStop(0, 'rgba(255,255,255,0.95)');
+      hg.addColorStop(0.3, 'rgba(255,255,255,0.35)');
+      hg.addColorStop(1, 'rgba(255,255,255,0)');
+      alpha(clamp((1 - k) * 5));
+      ctx.fillStyle = hg;
+      ctx.fillRect(hx - 34, hy - 34, 68, 68);
+    }
+  }
+  ctx.restore();
+}
+
+function textShadow(on) {
+  ctx.shadowColor = on ? 'rgba(0,0,0,0.45)' : 'transparent';
+  ctx.shadowBlur = on ? 30 : 0;
+  ctx.shadowOffsetY = on ? 6 : 0;
+}
+
+function drawHeadline(t) {
+  ctx.save();
+  ctx.font = `900 ${L.fs}px ${DISPLAY}`;
+  ctx.letterSpacing = L.ls;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  textShadow(CFG.transparent);
+  let k = 0;
+  L.lines.forEach((line, li) => {
+    let fill = '#FFFFFF';
+    if (li === L.lines.length - 1) {
+      fill = ctx.createLinearGradient(line.x, 0, line.x + line.w, 0);
+      fill.addColorStop(0, '#A48DFF');
+      fill.addColorStop(0.5, '#FF5E9A');
+      fill.addColorStop(1, '#FFB547');
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, line.y - L.fs * 1.0, W, L.fs * 1.32);
+    ctx.clip();
+    ctx.fillStyle = fill;
+    for (const w of line.words) {
+      const a = 0.44 + k++ * 0.07;
+      const p = prog(t, a, a + 0.62);
+      if (p <= 0) continue;
+      alpha(p * 2.5);
+      ctx.fillText(w.text, line.x + w.x, line.y + (1 - outExpo(p)) * L.fs * 1.15);
+    }
+    ctx.restore();
+  });
+  ctx.restore();
+}
+
+function drawHandle(t) {
+  if (L.handleY == null) return;
+  const p = prog(t, 0.8, 1.3);
+  if (p <= 0) return;
+  const e = outCubic(p);
+  ctx.save();
+  ctx.font = `600 46px ${TEXT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.letterSpacing = `${lerp(16, 1, e)}px`;
+  textShadow(CFG.transparent);
+  ctx.fillStyle = '#FFFFFF';
+  alpha(0.78 * e);
+  ctx.fillText(CFG.handle, W / 2, L.handleY + (1 - e) * 26);
+  ctx.restore();
+}
+
+function drawButton(t) {
+  const p = prog(t, 0.96, 1.42);
+  if (p <= 0) return;
+  const appear = lerp(0.4, 1, outBack(p, 2.4));
+  let press = 1;
+  if (t >= 1.8 && t < 1.9) press = 1 - 0.08 * outCubic(prog(t, 1.8, 1.9));
+  else if (t >= 1.9) press = 0.92 + 0.08 * outBack(prog(t, 1.9, 2.3), 3.2);
+  const m = inOutCubic(prog(t, 1.9, 2.1));
+  const w = lerp(L.bw0, L.bw1, outCubic(prog(t, 1.9, 2.15))), h = L.bh;
+  const A = clamp(p * 2.5);
+  const shape = () => { ctx.beginPath(); ctx.roundRect(-w / 2, -h / 2, w, h, h / 2); };
+
+  ctx.save();
+  ctx.translate(W / 2, L.btnY);
+  ctx.scale(appear * press, appear * press);
+
+  if (m < 1) {
+    const g = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+    g.addColorStop(0, C.violet);
+    g.addColorStop(0.55, C.pink);
+    g.addColorStop(1, C.amber);
+    ctx.save();
+    ctx.shadowColor = rgba(C.pink, 0.55);
+    ctx.shadowBlur = 60;
+    ctx.shadowOffsetY = 12;
+    alpha(A * (1 - m));
+    shape();
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.restore();
+  }
+  if (m > 0) {
+    alpha(A * m);
+    shape();
+    ctx.fillStyle = CFG.transparent ? 'rgba(18,16,30,0.62)' : 'rgba(255,255,255,0.09)';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.stroke();
+  }
+
+  ctx.save();
+  shape();
+  ctx.clip();
+
+  const sp = prog(t, 1.3, 1.75);
+  if (sp > 0 && sp < 1) {
+    const x = lerp(-w * 0.75, w * 0.75, inOutCubic(sp));
+    ctx.save();
+    ctx.transform(1, 0, -0.4, 1, 0, 0);
+    const sg = ctx.createLinearGradient(x - 80, 0, x + 80, 0);
+    sg.addColorStop(0, 'rgba(255,255,255,0)');
+    sg.addColorStop(0.5, 'rgba(255,255,255,0.55)');
+    sg.addColorStop(1, 'rgba(255,255,255,0)');
+    alpha(A * (1 - m));
+    ctx.fillStyle = sg;
+    ctx.fillRect(x - 80, -h, 160, h * 2);
+    ctx.restore();
+  }
+
+  ctx.font = `800 ${L.bfs}px ${DISPLAY}`;
+  ctx.letterSpacing = '0px';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = ctx.strokeStyle = '#FFFFFF';
+  ctx.lineCap = ctx.lineJoin = 'round';
+
+  if (m < 1) { // "+ Follow" rolls up and out
+    const x0 = -L.gA / 2, dy = -m * h * 0.8;
+    alpha(A * (1 - m));
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.moveTo(x0, dy); ctx.lineTo(x0 + 26, dy);
+    ctx.moveTo(x0 + 13, dy - 13); ctx.lineTo(x0 + 13, dy + 13);
+    ctx.stroke();
+    ctx.fillText(CFG.follow, x0 + 44, dy + L.bCap / 2);
+  }
+  if (m > 0) { // "✓ Following" rolls in from below, check mark draws itself
+    const x0 = -L.gB / 2, dy = (1 - m) * h * 0.8;
+    alpha(A * m);
+    const c = outCubic(prog(t, 1.98, 2.28));
+    ctx.lineWidth = 7;
+    ctx.setLineDash([60]);
+    ctx.lineDashOffset = 60 * (1 - c);
+    ctx.beginPath();
+    ctx.moveTo(x0 + 1, dy + 1); ctx.lineTo(x0 + 11, dy + 11); ctx.lineTo(x0 + 31, dy - 12);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillText(CFG.following, x0 + 50, dy + L.bCap / 2);
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawTouch(t) {
+  const p = prog(t, 1.3, 1.8), q = prog(t, 2.1, 2.4);
+  if (p <= 0 || q >= 1) return;
+  const tx = W / 2 + L.bw0 * 0.16, ty = L.btnY + 10;
+
+  const rp = prog(t, 1.88, 2.45);
+  if (rp > 0 && rp < 1) {
+    alpha(0.6 * (1 - rp));
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 6 * (1 - rp) + 1;
+    ctx.beginPath();
+    ctx.arc(tx, ty, 34 + outCubic(rp) * 240, 0, TAU);
+    ctx.stroke();
+  }
+
+  const e = outCubic(p);
+  const sx = tx + 300, sy = ty + 460, kx = tx + 330, ky = ty + 90;
+  let x = (1 - e) ** 2 * sx + 2 * (1 - e) * e * kx + e * e * tx;
+  let y = (1 - e) ** 2 * sy + 2 * (1 - e) * e * ky + e * e * ty;
+  const eq = inCubic(q);
+  x += eq * 240;
+  y += eq * 380;
+  let r = 46;
+  if (t >= 1.78 && t < 1.9) r = lerp(46, 34, outCubic(prog(t, 1.78, 1.9)));
+  else if (t >= 1.9) r = lerp(34, 46, outCubic(prog(t, 1.9, 2.1)));
+  r *= 1 - 0.35 * q;
+  const a = clamp(p * 3) * (1 - q) ** 2;
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.35)';
+  ctx.shadowBlur = 24;
+  ctx.shadowOffsetY = 6;
+  alpha(a * 0.5);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+  alpha(a * 0.95);
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, TAU);
+  ctx.stroke();
+}
+
+function drawConfetti(t) {
+  const dt = t - 1.92;
+  if (dt <= 0 || dt >= 1) return;
+  const drag = 3.2;
+  for (const c of CONFETTI) {
+    const d = (c.v * (1 - Math.exp(-drag * dt))) / drag;
+    const x = W / 2 + Math.cos(c.ang) * (L.bw1 * 0.42 + d);
+    const y = L.btnY + Math.sin(c.ang) * (L.bh * 0.45 + d) + 420 * dt * dt;
+    const s = c.size * outCubic(clamp(dt / 0.08));
+    alpha(1 - prog(dt, 0.5, 1));
+    ctx.fillStyle = c.c;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(c.rot + c.vr * dt);
+    if (c.bar) {
+      ctx.scale(1, Math.cos(dt * c.vr * 1.3));
+      ctx.beginPath();
+      ctx.roundRect(-s / 2, -s / 5, s, s / 2.5, 3);
+    } else {
+      ctx.beginPath();
+      ctx.arc(0, 0, s / 2.4, 0, TAU);
+    }
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawHearts(t) {
+  for (const h of HEARTS) {
+    const a = 1.96 + h.delay, p = prog(t, a, a + 0.95);
+    if (p <= 0 || p >= 1) continue;
+    const x = W / 2 + L.bw1 / 2 + 10 + h.dx + h.drift * outCubic(clamp(p * 3)) + Math.sin(p * TAU * 1.2 + h.ph) * 14;
+    const y = L.btnY - 20 - outCubic(p) * 360;
+    const s = (h.size / 20) * Math.max(0, outBack(clamp(p * 4), 2.5));
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.sin(p * 5 + h.ph) * 0.25);
+    ctx.scale(s, s);
+    ctx.translate(-12, -12.2);
+    const g = ctx.createLinearGradient(0, 3, 0, 21);
+    g.addColorStop(0, '#FF7AA8');
+    g.addColorStop(1, h.c);
+    ctx.fillStyle = g;
+    alpha(1 - prog(p, 0.55, 1));
+    ctx.fill(HEART);
+    ctx.restore();
+  }
+}
+
+function draw(target, t) {
+  ctx = target;
+  ctx.reset();
+  MASTER = 1;
+  if (!CFG.transparent) drawBackground(t);
+
+  const out = inCubic(prog(t, 2.7, 2.96));
+  MASTER = 1 - out;
+  const zoom = 1 + 0.03 * inOutCubic(prog(t, 0.3, 2.9)) - 0.05 * out;
+  ctx.save();
+  ctx.translate(W / 2, L.cy);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W / 2, -L.cy);
+  drawRings(t);
+  drawSparks(t);
+  drawAvatar(t);
+  drawHeadline(t);
+  drawHandle(t);
+  drawConfetti(t);
+  drawButton(t);
+  drawHearts(t);
+  drawTouch(t);
+  ctx.restore();
+
+  MASTER = 1;
+  if (!CFG.transparent && out > 0) {
+    ctx.globalAlpha = out;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// ---------- preview + offline render ----------
+const view = document.getElementById('c');
+const vctx = view.getContext('2d');
+
+window.setLogo = src => new Promise((resolve, reject) => {
+  const img = new Image();
+  img.onload = () => { logo = img; resolve(); };
+  img.onerror = reject;
+  img.src = src;
+});
+
+let work, wctx;
+// One output frame = several sub-frames averaged across half a frame (180° shutter), which gives natural motion blur.
+window.renderFrame = (i, sub = 8) => {
+  if (!work) {
+    work = document.createElement('canvas');
+    work.width = W;
+    work.height = H;
+    wctx = work.getContext('2d', { willReadFrequently: true });
+  }
+  const acc = new Float32Array(W * H * 4);
+  for (let s = 0; s < sub; s++) {
+    draw(wctx, Math.max(0, (i + ((s + 0.5) / sub - 0.5) * 0.5) / FPS));
+    const d = wctx.getImageData(0, 0, W, H).data;
+    for (let j = 0; j < d.length; j += 4) {
+      const a = d[j + 3];
+      acc[j] += d[j] * a;
+      acc[j + 1] += d[j + 1] * a;
+      acc[j + 2] += d[j + 2] * a;
+      acc[j + 3] += a;
+    }
+  }
+  const img = vctx.createImageData(W, H), o = img.data;
+  for (let j = 0; j < o.length; j += 4) {
+    const a = acc[j + 3];
+    if (a <= 0) continue;
+    const n = 1 / a;
+    // a little dither keeps the dark gradients from banding after compression
+    o[j] = acc[j] * n + Math.random() - Math.random();
+    o[j + 1] = acc[j + 1] * n + Math.random() - Math.random();
+    o[j + 2] = acc[j + 2] * n + Math.random() - Math.random();
+    o[j + 3] = a / sub;
+  }
+  vctx.putImageData(img, 0, 0);
+  return view.toDataURL('image/png');
+};
+
+window.outroReady = document.fonts.ready.then(() => buildLayout(vctx));
+
+if (q.get('render') === '1') {
+  document.body.classList.add('render');
+} else {
+  const playBtn = document.getElementById('play');
+  const scrub = document.getElementById('scrub');
+  const time = document.getElementById('time');
+  let playing = true, t0 = performance.now();
+  const show = t => { draw(vctx, t); scrub.value = t; time.textContent = t.toFixed(2); };
+  const loop = now => {
+    if (playing) show(Math.min(DURATION, ((now - t0) / 1000) % (DURATION + 0.6)));
+    requestAnimationFrame(loop);
+  };
+  const setPlaying = on => {
+    playing = on;
+    playBtn.textContent = on ? 'Pause' : 'Play';
+    if (on) t0 = performance.now() - scrub.value * 1000;
+  };
+  playBtn.onclick = () => setPlaying(!playing);
+  view.onclick = () => { scrub.value = 0; setPlaying(true); };
+  scrub.oninput = () => { setPlaying(false); show(+scrub.value); };
+  window.outroReady.then(() => requestAnimationFrame(loop));
+}
+</script>
+</body>
+</html>
